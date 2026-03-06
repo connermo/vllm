@@ -525,7 +525,7 @@ def test_malformed_tool_section_recovery(kimi_k2_tool_parser):
 
     # Simulate a lot of text without proper tool calls or section end
     # This should trigger the error recovery mechanism
-    large_text = "x" * 10000  # Exceeds max_section_chars
+    large_text = "x" * 70000  # Exceeds max_section_chars (65536)
 
     result2 = kimi_k2_tool_parser.extract_tool_calls_streaming(
         previous_text="<|tool_calls_section_begin|>",

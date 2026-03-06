@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # code modified from deepseekv3_tool_parser.py
 
+import json
 from collections.abc import Sequence
 
 import regex as re
@@ -39,12 +40,11 @@ class KimiK2ToolParser(ToolParser):
         # Section-level state management to prevent token leakage
         self.in_tool_section: bool = False
         self.token_buffer: str = ""
-        # Buffer size: empirical worst-case for longest marker (~30 chars) * 2
-        # + safety margin for unicode + partial overlap. Prevents unbounded growth.
-        self.buffer_max_size: int = 1024
+        # Max chars to retain for split-marker detection. The longest marker
+        # is <|tool_calls_section_begin|> (27 chars); we keep a 2x margin.
+        self.buffer_max_tail: int = 64
         self.section_char_count: int = 0  # Track characters processed in tool section
-        self.max_section_chars: int = 8192  # Force exit if section exceeds this
-        self._buffer_overflow_logged: bool = False  # Log overflow once per session
+        self.max_section_chars: int = 65536  # Force exit if section exceeds this
 
         # Support both singular and plural variants
         self.tool_calls_start_token: str = "<|tool_calls_section_begin|>"
@@ -71,6 +71,11 @@ class KimiK2ToolParser(ToolParser):
         )
 
         self.stream_tool_call_name_regex = re.compile(r"(?P<tool_call_id>.+:\d+)\s*")
+
+        # Robust tool ID parser: handles "functions.get_weather:0" and "get_weather:0"
+        self.tool_call_id_regex = re.compile(
+            r"^(?:functions\.)?(?P<name>[\w\.]+):(?P<index>\d+)$"
+        )
 
         if not self.model_tokenizer:
             raise ValueError(
@@ -103,6 +108,52 @@ class KimiK2ToolParser(ToolParser):
                 "Kimi-K2 Tool parser could not locate tool call start/end "
                 "tokens in the tokenizer!"
             )
+
+    def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
+        request = super().adjust_request(request)
+        if request.tools and request.tool_choice != "none":
+            # Ensure tool call special tokens are not skipped during decoding,
+            # so the parser can detect section/tool markers correctly.
+            request.skip_special_tokens = False
+
+            # Add tool_calls_section_end tokens as stop tokens. This prevents
+            # EOS from being sampled prematurely when JSON closing braces
+            # cause EOS logit spikes during tool_choice="auto" generation.
+            # The model will stop at section_end instead of EOS mid-JSON.
+            stop_token_ids = list(
+                request.stop_token_ids if request.stop_token_ids else []
+            )
+            for tid in self.tool_calls_end_token_ids:
+                if tid not in stop_token_ids:
+                    stop_token_ids.append(tid)
+            request.stop_token_ids = stop_token_ids
+
+            # The parser needs to see the stop token to detect section end.
+            request.include_stop_str_in_output = True
+
+        return request
+
+    def _parse_tool_id(self, raw_id: str) -> tuple[str, str]:
+        """Parse tool call ID into (function_name, raw_id).
+        Handles both 'functions.get_weather:0' and 'get_weather:0' formats.
+        Falls back to split-based parsing for unexpected formats.
+        """
+        raw_id = raw_id.strip()
+        m = self.tool_call_id_regex.match(raw_id)
+        if m:
+            return m.group("name"), raw_id
+        # Fallback for non-standard formats
+        function_name = raw_id.split(":")[0].split(".")[-1]
+        return function_name, raw_id
+
+    @staticmethod
+    def _is_complete_json(s: str) -> bool:
+        """Check if a string is a complete, valid JSON object."""
+        try:
+            json.loads(s)
+            return True
+        except (json.JSONDecodeError, ValueError):
+            return False
 
     def _check_and_strip_markers(self, text: str) -> tuple[str, bool, bool]:
         """
@@ -172,8 +223,9 @@ class KimiK2ToolParser(ToolParser):
                 tool_calls = []
                 for match in function_call_tuples:
                     function_id, function_args = match
-                    # function_id: functions.get_weather:0 or get_weather:0
-                    function_name = function_id.split(":")[0].split(".")[-1]
+                    function_name, function_id = self._parse_tool_id(
+                        function_id
+                    )
                     tool_calls.append(
                         ToolCall(
                             id=function_id,
@@ -213,20 +265,13 @@ class KimiK2ToolParser(ToolParser):
         # Flag to defer section exit until after tool parsing completes
         deferred_section_exit = False
 
-        # Add delta to buffer for split marker detection
+        # Add delta to buffer for split marker detection.
+        # Only keep the tail that could contain a partial marker to avoid
+        # unbounded growth (the old 1024-byte hard cap triggered spurious
+        # warnings on any response longer than ~1 KB).
         self.token_buffer += delta_text
-
-        # Enforce buffer size limit to prevent memory issues
-        if len(self.token_buffer) > self.buffer_max_size:
-            if not self._buffer_overflow_logged:
-                logger.warning(
-                    "Token buffer exceeded max size (%d bytes), flushing excess. "
-                    "This may indicate very long markers or unusual tokenization.",
-                    self.buffer_max_size,
-                )
-                self._buffer_overflow_logged = True
-            # Keep only the most recent content that might contain partial markers
-            self.token_buffer = self.token_buffer[-self.buffer_max_size // 2 :]
+        if len(self.token_buffer) > self.buffer_max_tail:
+            self.token_buffer = self.token_buffer[-self.buffer_max_tail :]
 
         # Check buffer for section markers (handles split tokens)
         buffered_text, found_section_begin, found_section_end = (
@@ -278,8 +323,6 @@ class KimiK2ToolParser(ToolParser):
         # Early return: if no section token detected yet, return as reasoning content
         if not has_section_token and not self.in_tool_section:
             logger.debug("No tool call tokens found!")
-            # Don't clear buffer - it needs to accumulate partial markers across deltas
-            # Buffer overflow is already protected by lines 215-224
             return DeltaMessage(content=delta_text)
 
         # Strip section markers from delta_text for subsequent processing
@@ -388,40 +431,62 @@ class KimiK2ToolParser(ToolParser):
                     if deferred_section_exit and self.in_tool_section:
                         self._reset_section_state()
                     return None
-                diff = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
-                if diff:
-                    diff = (
-                        diff.encode("utf-8").decode("unicode_escape")
-                        if diff is str
-                        else diff
+
+                # Compute the full arguments accumulated so far and find
+                # any remaining diff that hasn't been streamed yet.
+                prev_args = self.prev_tool_call_arr[self.current_tool_id].get(
+                    "arguments", ""
+                )
+                already_sent = self.streamed_args_for_tool[self.current_tool_id]
+
+                # Use JSON completeness to find the actual end of arguments
+                # instead of relying on hard-coded '"}' pattern (which fails
+                # for non-string-ending JSON like {"count": 42}).
+                if prev_args and self._is_complete_json(prev_args):
+                    diff = prev_args[len(already_sent):]
+                elif tool_call_portion:
+                    # tool_call_portion has the full args from begin to end
+                    tc_match = self.stream_tool_call_portion_regex.match(
+                        tool_call_portion
                     )
-                    if '"}' not in delta_text:
-                        # Handle deferred section exit before returning
-                        if deferred_section_exit and self.in_tool_section:
-                            self._reset_section_state()
-                        return None
-                    end_loc = delta_text.rindex('"}')
-                    diff = delta_text[:end_loc] + '"}'
+                    if tc_match:
+                        full_args = tc_match.group("function_arguments")
+                        full_args = full_args.split(
+                            self.tool_call_end_token, 1
+                        )[0].rstrip()
+                        diff = full_args[len(already_sent):]
+                    else:
+                        diff = ""
+                else:
+                    # Fallback: extract from delta_text, strip end marker
+                    stripped = delta_text.split(
+                        self.tool_call_end_token, 1
+                    )[0].rstrip()
+                    diff = stripped
+
+                if diff:
                     logger.debug(
                         "Finishing tool and found diff that had not "
                         "been streamed yet: %s",
                         diff,
                     )
                     self.streamed_args_for_tool[self.current_tool_id] += diff
-                    # Handle deferred section exit before returning
-                    if deferred_section_exit and self.in_tool_section:
-                        logger.debug("Completing deferred section exit")
-                        self._reset_section_state()
+                # Handle deferred section exit before returning
+                if deferred_section_exit and self.in_tool_section:
+                    logger.debug("Completing deferred section exit")
+                    self._reset_section_state()
+                if diff:
                     return DeltaMessage(
                         tool_calls=[
                             DeltaToolCall(
                                 index=self.current_tool_id,
-                                function=DeltaFunctionCall(arguments=diff).model_dump(
-                                    exclude_none=True
-                                ),
+                                function=DeltaFunctionCall(
+                                    arguments=diff
+                                ).model_dump(exclude_none=True),
                             )
                         ]
                     )
+                return None
 
             # case -- otherwise we're just generating text
             else:
@@ -447,8 +512,13 @@ class KimiK2ToolParser(ToolParser):
                 )
                 if current_tool_call_matches:
                     tool_id, tool_args = current_tool_call_matches.groups()
-                    tool_name = tool_id.split(":")[0].split(".")[-1]
-                    current_tool_call["id"] = tool_id.strip()
+                    # Strip tool_call_end marker from arguments to prevent
+                    # marker leakage into streamed content (SGLang pattern).
+                    tool_args = tool_args.split(
+                        self.tool_call_end_token, 1
+                    )[0]
+                    tool_name, tool_id = self._parse_tool_id(tool_id)
+                    current_tool_call["id"] = tool_id
                     current_tool_call["name"] = tool_name
                     current_tool_call["arguments"] = tool_args
                 else:
@@ -457,8 +527,10 @@ class KimiK2ToolParser(ToolParser):
                     )
                     if current_tool_call_name_matches:
                         (tool_id_str,) = current_tool_call_name_matches.groups()
-                        tool_name = tool_id_str.split(":")[0].split(".")[-1]
-                        current_tool_call["id"] = tool_id_str.strip()
+                        tool_name, tool_id_str = self._parse_tool_id(
+                            tool_id_str
+                        )
+                        current_tool_call["id"] = tool_id_str
                         current_tool_call["name"] = tool_name
                         current_tool_call["arguments"] = ""
                     else:
